@@ -1,0 +1,45 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import net from 'node:net';
+import {fileURLToPath} from 'node:url';
+import {DatabaseSync,backup} from 'node:sqlite';
+import {makeReport,reportText} from '../lib/journal.ts';
+test('local accounts, invitations, isolation, records, reports, restart and backups',async()=>{
+ const root=fileURLToPath(new URL('..',import.meta.url)),data=fs.mkdtempSync(path.join(os.tmpdir(),'dayfolio-local-test-'));
+ const reserve=net.createServer();reserve.listen(0,'127.0.0.1');await once(reserve,'listening');const port=reserve.address().port;await new Promise(r=>reserve.close(r));const origin=`http://127.0.0.1:${port}`;let child,logs='';
+ const start=async()=>{child=spawn(process.execPath,[path.join(root,'server/server.mjs')],{cwd:root,env:{...process.env,DAYFOLIO_PORT:String(port),DAYFOLIO_DATA_DIR:data},stdio:['ignore','pipe','pipe'],windowsHide:true});child.stdout.on('data',s=>logs+=s);child.stderr.on('data',s=>logs+=s);for(let i=0;i<100;i++){if(child.exitCode!==null)throw new Error(logs);try{const r=await fetch(origin+'/api/health');if(r.ok)return;}catch{}await new Promise(r=>setTimeout(r,100));}throw new Error('Server failed: '+logs);};
+ const stop=async()=>{if(child&&child.exitCode===null){const exited=once(child,'exit');child.kill();await exited;}};
+ const call=async(url,method='GET',body,cookie='')=>{const r=await fetch(origin+url,{method,headers:{Origin:origin,'Content-Type':'application/json',Cookie:cookie},...(body!==undefined?{body:JSON.stringify(body)}:{})});return {status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]||''};};
+ try{
+  await start();assert.equal((await fetch(origin)).status,200);assert.equal((await call('/api/session')).data.setupRequired,true);
+  assert.equal((await call('/api/entries?from=2026-09-14&to=2026-09-20')).status,401);
+  const owner=await call('/api/setup','POST',{name:'Test owner',email:'owner@example.test',password:'owner-test-password-5678'});assert.equal(owner.status,201);assert.ok(owner.cookie);assert.equal((await call('/api/session','GET',undefined,owner.cookie)).data.user.role,'owner');
+  assert.equal((await call('/api/setup','POST',{name:'Second',email:'second@example.test',password:'test-password-second'})).status,409);
+  assert.equal((await call('/api/login','POST',{email:'owner@example.test',password:'wrong'})).status,401);
+  const invite=await call('/api/invitations','POST',{email:'member@example.test'},owner.cookie);assert.equal(invite.status,201);const token=new URLSearchParams(new URL(invite.data.link).hash.slice(1)).get('invite');
+  assert.equal((await call('/api/register','POST',{name:'Wrong',email:'wrong@example.test',password:'member-test-password-123',token})).status,400);
+  const member=await call('/api/register','POST',{name:'Member',email:'member@example.test',password:'member-test-password-123',token});assert.equal(member.status,201);
+  assert.equal((await call('/api/register','POST',{name:'Member',email:'member@example.test',password:'member-test-password-123',token})).status,400);
+  assert.equal((await call('/api/invitations','GET',undefined,member.cookie)).status,403);
+  const input={kind:'research',title:'Baseline experiment',date:'2026-09-20',projectName:'Project A',body:'Result',progress:40,problems:'Imbalance',solution:'Sampling',nextSteps:'Compare recall',done:false};
+  const saved=await call('/api/entries','POST',input,owner.cookie);assert.equal(saved.status,201);const id=saved.data.entry.id;
+  const idea=await call('/api/entries','POST',{kind:'idea',title:'Hypothesis',date:'2026-09-20',projectName:'Project A',ideaType:'待验证假设'},owner.cookie);assert.equal(idea.status,201);
+  const query='/api/entries?from=2026-09-14&to=2026-09-20';const listed=await call(query,'GET',undefined,owner.cookie);assert.equal(listed.data.entries.length,2);assert.deepEqual(listed.data.projects,['Project A']);
+  assert.equal((await call(query,'GET',undefined,member.cookie)).data.entries.length,0);assert.equal((await call('/api/entries','PATCH',{id,body:'Forbidden'},member.cookie)).status,404);assert.equal((await call('/api/entries?id='+id,'DELETE',undefined,member.cookie)).status,404);
+  const completed=await call('/api/entries','PATCH',{id,done:true},owner.cookie);assert.equal(completed.data.entry.progress,100);assert.equal(completed.data.entry.solution,'Sampling');assert.equal((await call('/api/entries','PATCH',{id,done:false},owner.cookie)).data.entry.progress,null);
+  const report=makeReport(listed.data.entries,'2026-09-14','2026-09-20');assert.equal(report.projects.length,1);for(const value of ['Project A','40%','Imbalance','Sampling','Compare recall'])assert.ok(reportText(report).includes(value));
+  assert.equal((await call(query+'&ideaType='+encodeURIComponent('待验证假设'),'GET',undefined,owner.cookie)).data.ideaCount,1);
+  assert.equal((await call('/api/entries','POST',{...input,progress:101},owner.cookie)).status,400);
+  const csrf=await fetch(origin+'/api/entries',{method:'POST',headers:{Origin:'http://evil.example',Cookie:owner.cookie,'Content-Type':'application/json'},body:JSON.stringify(input)});assert.equal(csrf.status,403);
+  const people=await call('/api/invitations','GET',undefined,owner.cookie);const memberId=people.data.users.find(u=>u.email==='member@example.test').id;
+  assert.equal((await call('/api/members','PATCH',{id:memberId,active:false},owner.cookie)).status,200);assert.equal((await call(query,'GET',undefined,member.cookie)).status,401);
+  await stop();await start();assert.equal((await call(query,'GET',undefined,owner.cookie)).data.entries.length,2);
+  const database=new DatabaseSync(path.join(data,'dayfolio.sqlite'),{readOnly:true});const snap=path.join(data,'snapshot.sqlite');await backup(database,snap);database.close();const restored=new DatabaseSync(snap,{readOnly:true});assert.equal(restored.prepare('SELECT count(*) AS n FROM entries').get().n,2);assert.ok(!restored.prepare('SELECT password FROM users LIMIT 1').get().password.includes('owner-test'));restored.close();
+  assert.equal((await call('/api/session','DELETE',undefined,owner.cookie)).status,200);assert.equal((await call(query,'GET',undefined,owner.cookie)).status,401);
+ }finally{await stop();fs.rmSync(data,{recursive:true,force:true});}
+});
